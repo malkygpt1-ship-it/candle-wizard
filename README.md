@@ -1,108 +1,87 @@
-# vinext-starter
+# Candle Wizard
 
-A clean full-stack starter running on
-[vinext](https://github.com/cloudflare/vinext), with optional Cloudflare D1 and
-Drizzle support.
+Candle Wizard is a production operating system for a UK candle business. It brings inventory, purchasing, production planning, batches, costings, waste, lot traceability and an append-only audit trail into one Next.js application.
 
-## Prerequisites
+The live database is the **Candle Wizard** Supabase project in London (`eu-west-2`), project ref `sjqxpmevwnivweqtdcrs`.
 
-- Node.js `>=22.13.0`
-- Linux with `flock`, `curl`, and GNU `timeout`
+## Supplier catalogue
 
-## Sites Lifecycle
+The inventory includes 14 materials from Candle Shack Ltd, selected as a practical UK candle-supplies distributor. Each catalogue row includes:
 
-The Sites lifecycle CLI runs the locked dependency install before returning this checkout. Edit the source under `app/`, then checkpoint when a coherent milestone is ready to inspect or share. The remote Sites builder runs `npm run build` against the pushed commit. Do not repeat install or build as a normal pre-checkpoint step.
+- supplier SKU and product-page link;
+- pack size and base-unit cost;
+- supplier price excluding VAT;
+- supplier price including VAT;
+- price-check date; and
+- exactly zero starting stock.
 
-This starter does not use `wrangler.jsonc`.
+The original workbook records remain available alongside the sourced catalogue. Supplier prices are reference data and should be checked again before ordering.
 
-`install:ci` is intentionally a single, non-retrying `npm ci`. It refuses a concurrent install for the same project, consumes a matching image-seeded npm cache with `--prefer-offline` while retaining registry fallback for a missing cache object, otherwise downloads and verifies the complete vinext tarball recorded in `package-lock.json`, limits npm to one socket, and terminates a stalled install. `build` applies a short timeout and then validates the Sites artifact. These helpers target Linux and use GNU `timeout`; they are not native macOS scripts.
+## Stack
 
-Scripts that need writable project-scoped home, npm, XDG, and temporary paths use `scripts/sites-env.sh`. The `dev` and `start` scripts honor the caller's runtime environment and keep Wrangler logs inside the checkout. The generated `.sites-runtime/` directory is disposable and ignored by Git.
+- Next.js 16 App Router and React 19
+- Supabase Postgres 17 in `eu-west-2`
+- `postgres` with the Supabase transaction pooler
+- Tailwind CSS 4
+- Vercel-ready server-side API routes
 
-## Included Shape
+The database credential is only read inside the Node.js server runtime. No Supabase key or connection string is sent to the browser.
 
-- edit site code under `app/`
-- `app/chatgpt-auth.ts` provides optional dispatch-owned ChatGPT sign-in helpers
-- `.openai/hosting.json` declares optional Sites D1 and R2 bindings
-- `vite.config.ts` simulates declared bindings for local development
-- `db/index.ts` reads the D1 binding from the Cloudflare Worker environment
-- `db/schema.ts` starts intentionally empty
-- `examples/d1/` contains an optional D1 example surface
-- `drizzle.config.ts` supports local migration generation when needed
+## Deploy on Vercel
 
-## Workspace Auth Headers
+1. Import [malkygpt1-ship-it/candle-wizard](https://github.com/malkygpt1-ship-it/candle-wizard) into Vercel.
+2. Leave the detected framework as **Next.js** and use the standard `npm run build` command.
+3. Add the Supabase integration from the Vercel Marketplace and select the existing **Candle Wizard** project.
+4. Confirm that Vercel has added the pooled database URI as `POSTGRES_URL` for Production (and Preview if required).
+5. Deploy, then open `/api/snapshot` once to confirm the server can read Supabase.
 
-OpenAI workspace sites can read the current user's email from
-`oai-authenticated-user-email`.
+If the integration does not create `POSTGRES_URL`, open **Connect → Transaction pooler → URI** in the Supabase dashboard and add that URI manually in Vercel. Use transaction mode on port `6543`, keep SSL enabled, and never name the variable `NEXT_PUBLIC_POSTGRES_URL`.
 
-SIWC-authenticated workspace sites may also receive
-`oai-authenticated-user-full-name` when the user's SIWC profile has a non-empty
-`name` claim. The full-name value is percent-encoded UTF-8 and is accompanied by
-`oai-authenticated-user-full-name-encoding: percent-encoded-utf-8`.
+The remote database is already migrated and seeded. The first app request also runs the same idempotent seed path, so a fresh database can initialise itself safely.
 
-Treat the full name as optional and fall back to email when it is absent:
+> This is an operational write-enabled application. Before sharing the production URL, enable Vercel Deployment Protection or add application authentication.
 
-```tsx
-import { headers } from "next/headers";
+## Local development
 
-export default async function Home() {
-  const requestHeaders = await headers();
-  const email = requestHeaders.get("oai-authenticated-user-email");
-  const encodedFullName = requestHeaders.get("oai-authenticated-user-full-name");
-  const fullName =
-    encodedFullName &&
-    requestHeaders.get("oai-authenticated-user-full-name-encoding") ===
-      "percent-encoded-utf-8"
-      ? decodeURIComponent(encodedFullName)
-      : null;
-
-  const displayName = fullName ?? email;
-  // ...
-}
+```bash
+npm install
+cp .env.example .env.local
+npm run dev
 ```
 
-## Optional Dispatch-Owned ChatGPT Sign-In
+Replace the placeholder in `.env.local` with the Supabase transaction-pooler URI. The app also accepts `DATABASE_URL` or `SUPABASE_DB_URL`, but `POSTGRES_URL` is preferred for Vercel.
 
-Import the ready-to-use helpers from `app/chatgpt-auth.ts` when the site needs
-optional or required ChatGPT sign-in:
+## Database workflow
 
-- Use `getChatGPTUser()` for optional signed-in UI.
-- Use `requireChatGPTUser(returnTo)` for server-rendered pages that should send
-  anonymous visitors through Sign in with ChatGPT.
-- Use `chatGPTSignInPath(returnTo)` and `chatGPTSignOutPath(returnTo)` for
-  browser links or actions.
-- Pass a same-origin relative `returnTo` path for the destination after sign-in
-  or sign-out. The helper validates and safely encodes it.
-- Mark protected pages with `export const dynamic = "force-dynamic"` because
-  they depend on per-request identity headers.
+The committed files in `supabase/migrations/` match the migration history applied to the hosted project. To work with the CLI:
 
-Dispatch owns `/signin-with-chatgpt`, `/signout-with-chatgpt`, `/callback`, the
-OAuth cookies, and identity header injection. Do not implement app routes for
-those reserved paths. Routes that do not import and call the helper remain
-anonymous-compatible.
+```bash
+npx supabase login
+npx supabase link --project-ref sjqxpmevwnivweqtdcrs
+npx supabase migration list
+npx supabase db push
+```
 
-SIWC establishes identity only; it does not prove workspace membership. Use the
-Sites hosting platform's access policy controls for workspace-wide restrictions,
-or enforce explicit server-side membership or allowlist checks.
+To regenerate the replayable seed from the same TypeScript source used by the app:
 
-Use SIWC for account pages, user-specific dashboards, saved records, and write
-actions tied to the current ChatGPT user. Leave public content anonymous.
+```bash
+npm run db:seed:generate
+```
 
-## Diagnostic Commands
+Database controls include:
 
-- `npm run install:ci`: perform the one bounded lockfile install
-- `npm run dev`: start the Vite/Vinext development server
-- `npm run build`: build and validate the deployable Sites artifact
-- `npm run start`: start the built Vinext application
-- `npm test`: build, validate, and verify the rendered development-preview metadata
-- `npm run validate:artifact`: recheck an existing artifact's manifest and ESM `default.fetch` export
-- `npm run db:generate`: generate Drizzle migrations after schema changes
+- row-level security on all 15 application tables;
+- explicit deny policies and no table grants for browser roles;
+- atomic writes and idempotency records;
+- advisory-lock triggers that stop negative material stock and over-posted receipts;
+- native date/timestamp types, check constraints and indexed foreign keys; and
+- a one-to-one deferred link between waste events and stock movements.
 
-Use build and validation commands for targeted diagnosis after a remote failure, not as part of the normal checkpoint path.
+## Quality checks
 
-The timeout defaults can be overridden for a controlled canary with `SITES_INSTALL_TIMEOUT`, `SITES_INSTALL_KILL_AFTER`, `SITES_BUILD_TIMEOUT`, and `SITES_BUILD_KILL_AFTER`. A timeout fails the command; the helpers never retry an unchanged install or build.
+```bash
+npm run lint
+npm test
+```
 
-## Learn More
-
-- [vinext Documentation](https://github.com/cloudflare/vinext)
-- [Drizzle D1 Guide](https://orm.drizzle.team/docs/get-started/d1-new)
+`npm test` runs the domain and catalogue checks, followed by a production Next.js build.

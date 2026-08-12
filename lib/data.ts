@@ -1,22 +1,13 @@
-import { computeProductCost, computeSnapshot, normalizedImportedReceipt, purchaseOrderStatusAfterReceipt, quantityCostMicros, requiredMaterialsForProduct, type AuditRow, type BatchRow, type BomRow, type DomainState, type MaterialRow, type MovementRow, type PlanLineRow, type ProductRow, type PurchaseOrderLineRow, type PurchaseOrderRow, type SettingsRow, type SupplierRow, type WasteRow } from "./domain";
-import { workbookSeed } from "./workbook-seed";
-import { supplierCatalogue } from "./supplier-catalogue";
-import initialSchemaSql from "../drizzle/0000_optimal_joshua_kane.sql?raw";
+import { computeProductCost, computeSnapshot, normalizedImportedReceipt, purchaseOrderStatusAfterReceipt, quantityCostMicros, requiredMaterialsForProduct, type AuditRow, type BatchRow, type BomRow, type DomainState, type MaterialRow, type MovementRow, type PlanLineRow, type ProductRow, type PurchaseOrderLineRow, type PurchaseOrderRow, type SettingsRow, type SupplierRow, type WasteRow } from "./domain.ts";
+import { workbookSeed } from "./workbook-seed.ts";
+import { supplierCatalogue } from "./supplier-catalogue.ts";
+import { database, type Database, type DatabaseStatement } from "./postgres-db.ts";
 
 const WORKSPACE_ID = "lumina-main";
 const SEED_VERSION = "candle-workbook-2026-08-12-v9-candle-shack-catalogue";
 const seedSuppliers = [...workbookSeed.suppliers, supplierCatalogue.supplier];
 const seedMaterials = [...workbookSeed.materials, ...supplierCatalogue.materials];
-const OPERATIONAL_GUARDS_SQL = `CREATE TRIGGER IF NOT EXISTS \`app_material_stock_nonnegative\` BEFORE INSERT ON \`stock_movements\` WHEN NEW.\`source\` = 'app' AND NEW.\`item_kind\` = 'material' AND NEW.\`quantity_milli\` < 0 AND COALESCE((SELECT SUM(\`quantity_milli\`) FROM \`stock_movements\` WHERE \`item_kind\` = 'material' AND \`item_id\` = NEW.\`item_id\`), 0) + NEW.\`quantity_milli\` < 0 BEGIN SELECT RAISE(ABORT, 'Material stock would become negative.'); END;
-CREATE TRIGGER IF NOT EXISTS \`app_po_receipt_not_overposted\` BEFORE INSERT ON \`stock_movements\` WHEN NEW.\`source\` = 'app' AND NEW.\`movement_type\` = 'purchase_receipt' AND COALESCE((SELECT SUM(\`quantity_milli\`) FROM \`stock_movements\` WHERE \`movement_type\` = 'purchase_receipt' AND \`po_number\` = NEW.\`po_number\` AND \`item_id\` = NEW.\`item_id\`), 0) + NEW.\`quantity_milli\` > COALESCE((SELECT SUM(\`received_qty_milli\`) FROM \`purchase_order_lines\` WHERE \`po_number\` = NEW.\`po_number\` AND \`material_id\` = NEW.\`item_id\`), 0) BEGIN SELECT RAISE(ABORT, 'Receipt would exceed the recorded PO quantity.'); END;`;
-
-type Statement = ReturnType<D1Database["prepare"]>;
-
-function database(): D1Database {
-  const db = (globalThis as typeof globalThis & CandleRuntimeGlobal).__CANDLE_RUNTIME_ENV__?.DB;
-  if (!db) throw new Error("The application database is unavailable.");
-  return db;
-}
+type Statement = DatabaseStatement;
 
 function nullable(value: unknown) {
   return value === undefined ? null : value;
@@ -44,46 +35,13 @@ function safeId(prefix: string) {
   return `${prefix}-${crypto.randomUUID()}`;
 }
 
-async function runChunks(db: D1Database, statements: Statement[], chunkSize = 60) {
-  for (let index = 0; index < statements.length; index += chunkSize) {
-    await db.batch(statements.slice(index, index + chunkSize));
-  }
-}
-
-async function ensureSchema(db: D1Database) {
+async function ensureSchema(db: Database) {
   try {
     await db.prepare("SELECT 1 FROM app_meta LIMIT 1").first();
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
-    if (!/no such table:\s*app_meta/i.test(detail)) throw error;
-    const idempotentSchema = initialSchemaSql
-      .replaceAll("CREATE TABLE `", "CREATE TABLE IF NOT EXISTS `")
-      .replaceAll("CREATE INDEX `", "CREATE INDEX IF NOT EXISTS `")
-      .replaceAll("CREATE UNIQUE INDEX `", "CREATE UNIQUE INDEX IF NOT EXISTS `")
-      .replaceAll("CREATE TRIGGER `", "CREATE TRIGGER IF NOT EXISTS `")
-      .split("--> statement-breakpoint")
-      .map((statement) => statement.replace(/\s+/g, " ").trim())
-      .filter(Boolean)
-      .join("\n");
-    await db.exec(idempotentSchema);
+    throw new Error(`The Candle Wizard Supabase schema is unavailable. Apply the committed Supabase migration before starting the app. ${detail}`);
   }
-  const materialColumns = await db.prepare("PRAGMA table_info(materials)").all<{ name: string }>();
-  const existingColumns = new Set((materialColumns.results ?? []).map((column) => column.name));
-  const catalogueColumns = [
-    { name: "purchase_price_inc_vat_micros", sql: "ALTER TABLE materials ADD COLUMN purchase_price_inc_vat_micros integer" },
-    { name: "supplier_product_url", sql: "ALTER TABLE materials ADD COLUMN supplier_product_url text" },
-    { name: "price_checked_on", sql: "ALTER TABLE materials ADD COLUMN price_checked_on text" },
-  ];
-  for (const column of catalogueColumns) {
-    if (existingColumns.has(column.name)) continue;
-    try {
-      await db.prepare(column.sql).run();
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      if (!/duplicate column name/i.test(detail)) throw error;
-    }
-  }
-  await db.exec(OPERATIONAL_GUARDS_SQL);
 }
 
 function seedDomainState(): DomainState {
@@ -114,8 +72,7 @@ function seedDomainState(): DomainState {
   return { settings, suppliers, materials, products, bomItems, movements: [], purchaseOrders: [], purchaseOrderLines: [], batches: [], wasteEvents: [], planLines: [] };
 }
 
-export async function ensureSeeded() {
-  const db = database();
+export async function seedDatabase(db: Database) {
   await ensureSchema(db);
   const marker = await db.prepare("SELECT value FROM app_meta WHERE key = 'seed_version'").all();
   if (marker.results?.[0]?.value === SEED_VERSION) return;
@@ -125,36 +82,36 @@ export async function ensureSeeded() {
   const costByProduct = new Map(base.products.map((product) => [product.id, computeProductCost(product, base)]));
   const statements: Statement[] = [];
 
-  statements.push(db.prepare(`INSERT OR IGNORE INTO settings (workspace_id,business_name,currency_code,vat_bps,waste_bps,labour_rate_pence_per_hour,target_margin_bps,source_filename,imported_on) VALUES (?,?,?,?,?,?,?,?,?)`).bind(
+  statements.push(db.prepare(`INSERT INTO settings (workspace_id,business_name,currency_code,vat_bps,waste_bps,labour_rate_pence_per_hour,target_margin_bps,source_filename,imported_on) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`).bind(
     WORKSPACE_ID, base.settings.business_name, base.settings.currency_code, base.settings.vat_bps, base.settings.waste_bps, base.settings.labour_rate_pence_per_hour,
     base.settings.target_margin_bps, workbookSeed.source.filename, workbookSeed.source.importedOn,
   ));
 
-  for (const item of seedSuppliers) statements.push(db.prepare(`INSERT OR IGNORE INTO suppliers (id,name,contact_name,email,phone,website,address,lead_time_days,minimum_order_pence,payment_terms,materials_supplied,active,notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(
+  for (const item of seedSuppliers) statements.push(db.prepare(`INSERT INTO suppliers (id,name,contact_name,email,phone,website,address,lead_time_days,minimum_order_pence,payment_terms,materials_supplied,active,notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`).bind(
     item.id, item.name, nullable(item.contactName), nullable(item.email), nullable(item.phone), nullable(item.website), nullable(item.address), item.leadTimeDays,
     item.minimumOrderPence, nullable(item.paymentTerms), nullable(item.materialsSupplied), item.active ? 1 : 0, nullable(item.notes),
   ));
 
-  for (const item of seedMaterials) statements.push(db.prepare(`INSERT OR IGNORE INTO materials (id,name,category,supplier_id,supplier_sku,unit,pack_size_milli,purchase_price_micros,purchase_price_inc_vat_micros,unit_cost_micros,last_purchase_unit_cost_micros,minimum_stock_milli,reorder_point_milli,preferred_order_qty_milli,lead_time_days,location,supplier_product_url,price_checked_on,active) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(
+  for (const item of seedMaterials) statements.push(db.prepare(`INSERT INTO materials (id,name,category,supplier_id,supplier_sku,unit,pack_size_milli,purchase_price_micros,purchase_price_inc_vat_micros,unit_cost_micros,last_purchase_unit_cost_micros,minimum_stock_milli,reorder_point_milli,preferred_order_qty_milli,lead_time_days,location,supplier_product_url,price_checked_on,active) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`).bind(
     item.id, item.name, item.category, nullable(item.supplierId), nullable(item.supplierSku), item.unit, item.packSizeMilli, item.purchasePriceMicros,
     "purchasePriceIncVatMicros" in item ? item.purchasePriceIncVatMicros : null, item.unitCostMicros, item.lastPurchaseUnitCostMicros,
     item.minimumStockMilli, item.reorderPointMilli, item.preferredOrderQtyMilli, item.leadTimeDays, nullable(item.location),
     "supplierProductUrl" in item ? item.supplierProductUrl : null, "priceCheckedOn" in item ? item.priceCheckedOn : null, item.active ? 1 : 0,
   ));
 
-  for (const item of workbookSeed.products) statements.push(db.prepare(`INSERT OR IGNORE INTO products (id,sku,name,collection,candle_type,container_size_ml,wax_weight_milli,fragrance,fragrance_bps,wick_type,colour,selling_price_pence,target_stock_milli,production_trigger_milli,direct_labour_minutes_milli,packaging_labour_minutes_milli,energy_cost_micros,overhead_cost_micros,selling_cost_micros,active) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(
+  for (const item of workbookSeed.products) statements.push(db.prepare(`INSERT INTO products (id,sku,name,collection,candle_type,container_size_ml,wax_weight_milli,fragrance,fragrance_bps,wick_type,colour,selling_price_pence,target_stock_milli,production_trigger_milli,direct_labour_minutes_milli,packaging_labour_minutes_milli,energy_cost_micros,overhead_cost_micros,selling_cost_micros,active) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`).bind(
     item.id, item.sku, item.name, item.collection, item.candleType, item.containerSizeMl, item.waxWeightMilli, item.fragrance, item.fragranceBps, item.wickType, item.colour,
     item.sellingPricePence, item.targetStockMilli, item.productionTriggerMilli, item.directLabourMinutesMilli, item.packagingLabourMinutesMilli, item.energyCostMicros,
     item.overheadCostMicros, item.sellingCostMicros, item.active ? 1 : 0,
   ));
 
-  for (const item of workbookSeed.bomItems) statements.push(db.prepare(`INSERT OR IGNORE INTO bom_items (product_id,material_id,quantity_milli) VALUES (?,?,?)`).bind(item.productId, item.materialId, item.quantityMilli));
+  for (const item of workbookSeed.bomItems) statements.push(db.prepare(`INSERT INTO bom_items (product_id,material_id,quantity_milli) VALUES (?,?,?) ON CONFLICT DO NOTHING`).bind(item.productId, item.materialId, item.quantityMilli));
 
-  statements.push(db.prepare(`INSERT OR IGNORE INTO production_plans (id,name,status,notes) VALUES (?,?,?,?)`).bind("PLAN-IMPORT-001", "Imported workbook scenario", "scenario", "Planning scratchpad imported without reserving stock."));
-  for (const line of workbookSeed.productionPlanLines) statements.push(db.prepare(`INSERT OR IGNORE INTO production_plan_lines (plan_id,line_no,product_id,desired_qty_milli,notes) VALUES (?,?,?,?,?)`).bind("PLAN-IMPORT-001", line.line, line.productId, line.desiredQtyMilli, nullable(line.notes)));
+  statements.push(db.prepare(`INSERT INTO production_plans (id,name,status,notes) VALUES (?,?,?,?) ON CONFLICT DO NOTHING`).bind("PLAN-IMPORT-001", "Imported workbook scenario", "scenario", "Planning scratchpad imported without reserving stock."));
+  for (const line of workbookSeed.productionPlanLines) statements.push(db.prepare(`INSERT INTO production_plan_lines (plan_id,line_no,product_id,desired_qty_milli,notes) VALUES (?,?,?,?,?) ON CONFLICT DO NOTHING`).bind("PLAN-IMPORT-001", line.line, line.productId, line.desiredQtyMilli, nullable(line.notes)));
 
   for (const po of workbookSeed.purchaseOrders) {
-    statements.push(db.prepare(`INSERT OR IGNORE INTO purchase_orders (po_number,order_date,supplier_id,status,expected_date,actual_date,notes) VALUES (?,?,?,?,?,?,?)`).bind(po.poNumber, po.orderDate, po.supplierId, po.status, nullable(po.expectedDate), nullable(po.actualDate), nullable(po.notes)));
+    statements.push(db.prepare(`INSERT INTO purchase_orders (po_number,order_date,supplier_id,status,expected_date,actual_date,notes) VALUES (?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`).bind(po.poNumber, po.orderDate, po.supplierId, po.status, nullable(po.expectedDate), nullable(po.actualDate), nullable(po.notes)));
     for (const line of po.lines) {
       const material = materialById.get(line.materialId!)!;
       const importedUnitPriceMicros = line.unitPriceMicros > 0 ? line.unitPriceMicros : material.unit_cost_micros;
@@ -174,7 +131,7 @@ export async function ensureSeeded() {
     const goodQty = Math.max(0, batch.actualProducedMilli - batch.rejectedMilli);
     const totalCost = batch.status === "completed" ? quantityCostMicros(batch.actualProducedMilli, unitCost) : null;
     const wasteCost = batch.status === "completed" ? quantityCostMicros(batch.rejectedMilli, unitCost) : null;
-    statements.push(db.prepare(`INSERT OR IGNORE INTO production_batches (id,production_date,product_id,planned_qty_milli,actual_produced_milli,rejected_milli,status,operator,wax_lot,fragrance_lot,container_lot,unit_cost_snapshot_micros,total_cost_snapshot_micros,waste_cost_snapshot_micros,completed_at,notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(
+    statements.push(db.prepare(`INSERT INTO production_batches (id,production_date,product_id,planned_qty_milli,actual_produced_milli,rejected_milli,status,operator,wax_lot,fragrance_lot,container_lot,unit_cost_snapshot_micros,total_cost_snapshot_micros,waste_cost_snapshot_micros,completed_at,notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`).bind(
       batch.id, batch.productionDate, batch.productId, batch.plannedQtyMilli, batch.actualProducedMilli, batch.rejectedMilli, batch.status, nullable(batch.operator), nullable(batch.waxLot),
       nullable(batch.fragranceLot), nullable(batch.containerLot), batch.status === "completed" ? unitCost : null, totalCost, wasteCost, batch.status === "completed" ? `${batch.productionDate}T17:00:00.000Z` : null, nullable(batch.notes),
     ));
@@ -188,7 +145,7 @@ export async function ensureSeeded() {
     const unitCost = material?.unit_cost_micros ?? productCost?.totalCostMicros ?? 0;
     const matchingWaste = workbookSeed.wasteEvents.find((event) => movement.movementType === "waste" && movement.batchId === event.batchId && movement.itemId === event.materialId && Math.abs(movement.quantityMilli) === event.quantityMilli);
     if (matchingWaste) existingWasteMovementByKey.set(matchingWaste.id!, movement.id!);
-    statements.push(db.prepare(`INSERT OR IGNORE INTO stock_movements (id,occurred_on,item_kind,item_id,movement_type,quantity_milli,unit_cost_micros,batch_id,po_number,lot_ref,waste_event_id,reason,source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(
+    statements.push(db.prepare(`INSERT INTO stock_movements (id,occurred_on,item_kind,item_id,movement_type,quantity_milli,unit_cost_micros,batch_id,po_number,lot_ref,waste_event_id,reason,source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`).bind(
       movement.id, movement.date, movement.itemKind, movement.itemId, movement.movementType, movement.quantityMilli, unitCost, nullable(movement.batchId), nullable(movement.poNumber),
       nullable(movement.lotRef), matchingWaste?.id ?? null, nullable(movement.notes), "workbook_import",
     ));
@@ -227,7 +184,7 @@ export async function ensureSeeded() {
       correctionMovements.push({ id: movementId, date: event.date!, itemKind: "material", itemId: event.materialId!, movementType: "waste", quantityMilli: -event.quantityMilli, unitCostMicros: material.unit_cost_micros, batchId: event.batchId, lotRef: event.lotRef, wasteEventId: event.id, reason: `Reconciled ${event.wasteType} event missing from the workbook ledger.` });
     }
     const material = materialById.get(event.materialId!)!;
-    statements.push(db.prepare(`INSERT OR IGNORE INTO waste_events (id,occurred_on,batch_id,product_id,material_id,waste_type,lot_ref,quantity_milli,unit,unit_cost_snapshot_micros,stock_movement_id,notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).bind(
+    statements.push(db.prepare(`INSERT INTO waste_events (id,occurred_on,batch_id,product_id,material_id,waste_type,lot_ref,quantity_milli,unit,unit_cost_snapshot_micros,stock_movement_id,notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`).bind(
       event.id, event.date, nullable(event.batchId), nullable(event.productId), event.materialId, event.wasteType, nullable(event.lotRef), event.quantityMilli, event.unit,
       material.unit_cost_micros, movementId, nullable(event.notes),
     ));
@@ -246,18 +203,23 @@ export async function ensureSeeded() {
     { id: "AUD-IMPORT-005", entity: "purchase_orders", action: "partial_receipt_reconciled", effects: { poNumber: "PO-26002", workbookFormulaOutstandingUnits: 72, noteStatedOutstandingUnits: 36, adoptedReceivedUnits: 72, adoptedOutstandingUnits: 36 } },
     { id: "AUD-IMPORT-006", entity: "purchase_orders", action: "purchase_prices_reconstructed", effects: { zeroPricedPoLines: 6, basis: "Imported material base-unit purchase cost", downstreamChecksRestored: ["PO total", "outstanding value", "supplier minimum"] } },
     { id: "AUD-IMPORT-007", entity: "purchase_orders", action: "receipt_status_normalized", effects: { workbookLinesWithReceivedEqualOrdered: 5, legitimateReceiptsRetained: ["PO-26002", "PO-26005"], nonReceivedStatusesForcedToZero: ["draft", "ordered", "cancelled"] } },
-    { id: "AUD-IMPORT-008", entity: "controls", action: "concurrency_guards_installed", effects: { databaseGuards: ["material stock cannot cross below zero from an app write", "PO receipts cannot be double-posted"], transactionMode: "atomic D1 batch", idempotencyKeys: true } },
+    { id: "AUD-IMPORT-008", entity: "controls", action: "concurrency_guards_installed", effects: { databaseGuards: ["material stock cannot cross below zero from an app write", "PO receipts cannot be double-posted"], transactionMode: "atomic PostgreSQL transaction", idempotencyKeys: true } },
     { id: "AUD-CATALOGUE-001", entity: "supplier_catalogue", action: "supplier_catalogue_imported", effects: { supplierId: supplierCatalogue.source.supplierId, supplierName: supplierCatalogue.supplier.name, materialsAdded: supplierCatalogue.materials.length, initialOnHandMilli: 0, vatBps: supplierCatalogue.source.vatBps, priceCheckedOn: supplierCatalogue.source.priceCheckedOn, selectionBasis: supplierCatalogue.source.selectionBasis, productPagesAttached: true } },
   ];
   for (const audit of importAudits) statements.push(db.prepare(`INSERT INTO audit_events (id,occurred_at,actor,entity_type,entity_id,action,before_json,after_json,effects_json,source) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET occurred_at=excluded.occurred_at, effects_json=excluded.effects_json`).bind(
     audit.id, `${workbookSeed.source.importedOn}T08:00:00.000Z`, "Migration engine", audit.entity, audit.id, audit.action, null, null, json(audit.effects), "migration_reconciliation",
   ));
 
-  await runChunks(db, statements);
-  await db.prepare(`INSERT INTO app_meta (key,value,updated_at) VALUES ('seed_version',?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP`).bind(SEED_VERSION).run();
+  statements.unshift(db.prepare("SELECT pg_advisory_xact_lock(hashtext('candle-wizard-seed'))"));
+  statements.push(db.prepare(`INSERT INTO app_meta (key,value,updated_at) VALUES ('seed_version',?,CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP`).bind(SEED_VERSION));
+  await db.batch(statements);
 }
 
-async function queryRows<T>(db: D1Database, sql: string, ...bindings: unknown[]): Promise<T[]> {
+export async function ensureSeeded() {
+  await seedDatabase(database());
+}
+
+async function queryRows<T extends Record<string, unknown>>(db: Database, sql: string, ...bindings: unknown[]): Promise<T[]> {
   const result = await db.prepare(sql).bind(...bindings).all<T>();
   return result.results ?? [];
 }
@@ -318,13 +280,13 @@ function validateIdempotencyKey(key: unknown) {
   return key;
 }
 
-function auditStatement(db: D1Database, input: { actor: string; entityType: string; entityId: string; action: string; before?: unknown; after?: unknown; effects: unknown; idempotencyKey: string }) {
+function auditStatement(db: Database, input: { actor: string; entityType: string; entityId: string; action: string; before?: unknown; after?: unknown; effects: unknown; idempotencyKey: string }) {
   return db.prepare(`INSERT INTO audit_events (id,occurred_at,actor,entity_type,entity_id,action,before_json,after_json,effects_json,idempotency_key,source) VALUES (?,?,?,?,?,?,?,?,?,?,?)`).bind(
     safeId("AUD"), nowIso(), input.actor, input.entityType, input.entityId, input.action, input.before === undefined ? null : json(input.before), input.after === undefined ? null : json(input.after), json(input.effects), input.idempotencyKey, "app",
   );
 }
 
-function idempotencyStatement(db: D1Database, key: string, action: string, response: unknown) {
+function idempotencyStatement(db: Database, key: string, action: string, response: unknown) {
   return db.prepare("INSERT INTO idempotency_keys (key,action,response_json) VALUES (?,?,?)").bind(key, action, json(response));
 }
 

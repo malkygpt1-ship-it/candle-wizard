@@ -334,7 +334,9 @@ test("supplier-quoted inc-VAT prices remain attached when workspace VAT policy c
 });
 
 test("database migration contains stock and receipt concurrency guards", () => {
-  const sql = readFileSync(new URL("../drizzle/0000_optimal_joshua_kane.sql", import.meta.url), "utf8");
+  const sql = readFileSync(new URL("../supabase/migrations/20260812191928_candle_wizard_initial_schema.sql", import.meta.url), "utf8");
   assert.match(sql, /app_material_stock_nonnegative/);
   assert.match(sql, /app_po_receipt_not_overposted/);
+  assert.match(sql, /enable row level security/);
+  assert.match(sql, /revoke all on table public\.%I from anon, authenticated/);
 });

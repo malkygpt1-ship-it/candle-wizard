@@ -1,6 +1,7 @@
 import { loadSnapshot, requestActor, runAction } from "../../../lib/data";
 
 export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
 
 export async function POST(request: Request) {
   try {
